@@ -1,0 +1,473 @@
+import { useEffect, useMemo, useState, type ChangeEvent } from 'react';
+
+type User = {
+  id: string;
+  name: string;
+  email: string;
+  picture?: string;
+};
+
+type EmailItem = {
+  id: number;
+  recipient: string;
+  subject: string;
+  scheduled_for: string;
+  status: string;
+  sender: string;
+  sent_at?: string | null;
+};
+
+const API_BASE = 'http://localhost:4000/api';
+
+const prettyDate = (value: string | null | undefined) => {
+  if (!value) return '—';
+  return new Date(value).toLocaleString();
+};
+
+const parseRecipients = (value: string) =>
+  value
+    .split(/[\n,;]+/)
+    .map((email) => email.trim())
+    .filter(Boolean)
+    .map((email) => email.replace(/^['"]|['"]$/g, ''))
+    .filter((email) => email.includes('@'));
+
+function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [tab, setTab] = useState<'scheduled' | 'sent' | 'failed'>('scheduled');
+  const [scheduled, setScheduled] = useState<EmailItem[]>([]);
+  const [sent, setSent] = useState<EmailItem[]>([]);
+  const [failed, setFailed] = useState<EmailItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [composeOpen, setComposeOpen] = useState(false);
+
+  const getDefaultStartTime = () => {
+    const now = new Date();
+    now.setMinutes(now.getMinutes() + 2);
+    now.setSeconds(0, 0);
+    return now.toISOString().slice(0, 16);
+  };
+
+  const [form, setForm] = useState({
+    subject: '',
+    body: '',
+    recipients: '',
+    startTime: getDefaultStartTime(),
+    delayBetweenEmails: '2',
+    hourlyLimit: '50',
+    senderEmail: user?.email || '',
+  });
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+
+  const fetchMe = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/auth/me`, { credentials: 'include' });
+      if (!response.ok) return;
+      const data = await response.json();
+      setUser(data.user);
+      setForm((prev) => ({ ...prev, senderEmail: data.user.email }));
+    } catch {
+      setUser(null);
+    }
+  };
+
+  const fetchEmails = async () => {
+    setLoading(true);
+    try {
+      const [scheduledRes, sentRes, failedRes] = await Promise.all([
+        fetch(`${API_BASE}/emails/scheduled`),
+        fetch(`${API_BASE}/emails/sent`),
+        fetch(`${API_BASE}/emails/failed`),
+      ]);
+
+      const scheduledData = await scheduledRes.json();
+      const sentData = await sentRes.json();
+      const failedData = await failedRes.json();
+      setScheduled(scheduledData.emails || []);
+      setSent(sentData.emails || []);
+      setFailed(failedData.emails || []);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchMe();
+    fetchEmails();
+  }, []);
+
+  useEffect(() => {
+    if (window.location.search.includes('auth=success')) {
+      fetchMe();
+      fetchEmails();
+      window.history.replaceState({}, '', '/');
+    }
+  }, []);
+
+  const handleGoogleLogin = () => {
+    window.location.href = `${API_BASE}/auth/google`;
+  };
+
+  const handleLogout = async () => {
+    await fetch(`${API_BASE}/auth/logout`, { method: 'POST', credentials: 'include' });
+    setUser(null);
+  };
+
+  const handleCsvUpload = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const emails = parseRecipients(text);
+      if (emails.length === 0) {
+        setError('No valid email addresses were found in the CSV file.');
+        return;
+      }
+
+      const mergedRecipients = Array.from(new Set([
+        ...parseRecipients(form.recipients),
+        ...emails,
+      ])).join(',\n');
+
+      setForm({ ...form, recipients: mergedRecipients });
+      setError('');
+    } catch {
+      setError('Failed to read the CSV file. Please try again.');
+    } finally {
+      event.target.value = '';
+    }
+  };
+
+  const handleSchedule = async () => {
+    setError('');
+    setSuccess('');
+
+    const recipients = form.recipients
+      .split(/[\n,]/)
+      .map((email) => email.trim())
+      .filter(Boolean);
+
+    const validRecipients = recipients.filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
+    const trimmedSubject = form.subject.trim();
+    const trimmedBody = form.body.trim();
+    const validStartTime = form.startTime && !Number.isNaN(new Date(form.startTime).getTime());
+    const senderEmail = form.senderEmail?.trim();
+
+    if (!trimmedSubject || !trimmedBody || !validStartTime || validRecipients.length === 0 || !senderEmail) {
+      setError('Please fill in all required fields: subject, body, at least one valid email, sender, and start time.');
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE}/emails/schedule`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          to: validRecipients,
+          subject: trimmedSubject,
+          body: trimmedBody,
+          sender: senderEmail,
+          scheduledFor: new Date(form.startTime).toISOString(),
+          delayBetweenEmails: Number(form.delayBetweenEmails),
+          hourlyLimit: Number(form.hourlyLimit),
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        setError(data.message || 'Scheduling failed.');
+        return;
+      }
+
+      setSuccess(`Scheduled ${data.total} email${data.total > 1 ? 's' : ''}.`);
+      setForm({
+        subject: '',
+        body: '',
+        recipients: '',
+        startTime: getDefaultStartTime(),
+        delayBetweenEmails: '2',
+        hourlyLimit: '50',
+        senderEmail: user?.email || '',
+      });
+      setComposeOpen(false);
+      setTimeout(() => fetchEmails(), 500);
+    } catch {
+      setError('Something went wrong while scheduling the email.');
+    }
+  };
+
+  const emailCount = useMemo(
+    () => parseRecipients(form.recipients).filter((item) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item)).length,
+    [form.recipients],
+  );
+
+  const currentEmails = tab === 'scheduled' ? scheduled : tab === 'sent' ? sent : failed;
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 to-slate-800 flex items-center justify-center p-6">
+        <div className="w-full max-w-md rounded-2xl bg-white p-8 shadow-2xl border border-slate-200">
+          <div className="mb-6">
+            <div className="text-3xl font-bold text-slate-900">ReachInbox</div>
+            <p className="mt-2 text-sm text-slate-600">Email scheduler dashboard</p>
+          </div>
+          <button
+            onClick={handleGoogleLogin}
+            className="w-full rounded-xl bg-blue-600 px-4 py-3 text-white font-semibold hover:bg-blue-700 transition"
+          >
+            Continue with Google
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-100 text-slate-800">
+      <header className="border-b border-slate-200 bg-white shadow-sm">
+        <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+          <div>
+            <div className="text-xl font-bold text-slate-900">ReachInbox</div>
+            <div className="text-xs text-slate-500">Email Scheduler</div>
+          </div>
+          <div className="flex items-center gap-4">
+            <img
+              src={user.picture || 'https://ui-avatars.com/api/?name=' + encodeURIComponent(user.name)}
+              alt={user.name}
+              className="h-10 w-10 rounded-full object-cover"
+            />
+            <div className="text-right">
+              <div className="font-medium text-sm">{user.name}</div>
+              <div className="text-xs text-slate-500">{user.email}</div>
+            </div>
+            <button
+              onClick={handleLogout}
+              className="rounded-lg border border-slate-200 px-3 py-2 text-sm hover:bg-slate-50 transition"
+            >
+              Logout
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto px-4 py-8">
+        <div className="flex justify-between items-center mb-6">
+          <div className="flex gap-2">
+            {['scheduled', 'sent', 'failed'].map((t) => (
+              <button
+                key={t}
+                onClick={() => setTab(t as any)}
+                className={`rounded-xl px-4 py-2 font-medium transition ${
+                  tab === t
+                    ? 'bg-slate-900 text-white'
+                    : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                {t.charAt(0).toUpperCase() + t.slice(1)}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => {
+              setComposeOpen(true);
+              setError('');
+              setSuccess('');
+            }}
+            className="rounded-xl bg-blue-600 text-white px-4 py-2 font-medium hover:bg-blue-700 transition"
+          >
+            Compose New Email
+          </button>
+        </div>
+
+        {error && (
+          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {error}
+          </div>
+        )}
+        {success && (
+          <div className="mb-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">
+            {success}
+          </div>
+        )}
+
+        {loading ? (
+          <div className="rounded-2xl bg-white border border-slate-200 p-8 text-center text-slate-500">
+            Loading emails…
+          </div>
+        ) : currentEmails.length === 0 ? (
+          <div className="rounded-2xl bg-white border border-slate-200 p-12 text-center">
+            <div className="text-slate-400 mb-2">??</div>
+            <p className="text-slate-500">
+              No {tab} emails yet.
+              {tab === 'scheduled' && ' Start composing to schedule your first email!'}
+            </p>
+          </div>
+        ) : (
+          <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
+                <tr>
+                  <th className="px-4 py-3 font-medium">Email</th>
+                  <th className="px-4 py-3 font-medium">Subject</th>
+                  <th className="px-4 py-3 font-medium">{tab === 'scheduled' ? 'Scheduled Time' : 'Time'}</th>
+                  <th className="px-4 py-3 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {currentEmails.map((item) => (
+                  <tr key={item.id} className="border-t border-slate-200 hover:bg-slate-50 transition">
+                    <td className="px-4 py-3 text-sm">{item.recipient}</td>
+                    <td className="px-4 py-3 text-sm font-medium">{item.subject}</td>
+                    <td className="px-4 py-3 text-sm">
+                      {tab === 'scheduled' ? prettyDate(item.scheduled_for) : prettyDate(item.sent_at)}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span
+                        className={`rounded-full px-3 py-1 text-xs font-medium ${
+                          item.status === 'sent'
+                            ? 'bg-green-100 text-green-700'
+                            : item.status === 'failed'
+                              ? 'bg-red-100 text-red-700'
+                              : 'bg-blue-100 text-blue-700'
+                        }`}
+                      >
+                        {item.status.charAt(0).toUpperCase() + item.status.slice(1)}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </main>
+
+      {composeOpen && (
+        <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-5 z-50">
+          <div className="w-full max-w-2xl rounded-2xl bg-white shadow-xl max-h-[90vh] overflow-y-auto">
+            <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between">
+              <h2 className="text-xl font-bold">Compose New Email</h2>
+              <button
+                onClick={() => setComposeOpen(false)}
+                className="text-slate-400 hover:text-slate-600 text-2xl leading-none"
+              >
+                ?
+              </button>
+            </div>
+
+            <div className="p-6 grid gap-4">
+              <div>
+                <label className="mb-2 block text-sm font-medium">Sender Email</label>
+                <input
+                  type="email"
+                  value={form.senderEmail}
+                  onChange={(e) => setForm({ ...form, senderEmail: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="your-email@example.com"
+                />
+              </div>
+
+              <div>
+                <label className="mb-2 block text-sm font-medium">Subject *</label>
+                <input
+                  value={form.subject}
+                  onChange={(e) => setForm({ ...form, subject: e.target.value })}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="Email subject"
+                />
+              </div>
+
+              <div>
+                <label className="mb-2 block text-sm font-medium">Body *</label>
+                <textarea
+                  value={form.body}
+                  onChange={(e) => setForm({ ...form, body: e.target.value })}
+                  rows={4}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  placeholder="Email body / content"
+                />
+              </div>
+
+              <div>
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <label className="block text-sm font-medium">Recipients *</label>
+                  <label className="cursor-pointer rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 transition">
+                    Upload CSV
+                    <input type="file" accept=".csv,text/csv,text/plain" className="hidden" onChange={handleCsvUpload} />
+                  </label>
+                </div>
+                <textarea
+                  value={form.recipients}
+                  onChange={(e) => setForm({ ...form, recipients: e.target.value })}
+                  rows={4}
+                  placeholder="one per line, comma-separated, or upload a CSV file"
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
+                  <span>? Detected {emailCount} valid address(es)</span>
+                  <span>CSV can include emails in one column</span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-4">
+                <div>
+                  <label className="mb-2 block text-sm font-medium">Start Time *</label>
+                  <input
+                    type="datetime-local"
+                    value={form.startTime}
+                    onChange={(e) => setForm({ ...form, startTime: e.target.value })}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="mb-2 block text-sm font-medium">Delay (sec) *</label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={form.delayBetweenEmails}
+                    onChange={(e) => setForm({ ...form, delayBetweenEmails: e.target.value })}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <div className="text-xs text-slate-500 mt-1">Min between sends</div>
+                </div>
+                <div>
+                  <label className="mb-2 block text-sm font-medium">Hourly Limit *</label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={form.hourlyLimit}
+                    onChange={(e) => setForm({ ...form, hourlyLimit: e.target.value })}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <div className="text-xs text-slate-500 mt-1">Max per hour</div>
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-3 pt-4 border-t border-slate-200">
+                <button
+                  onClick={() => setComposeOpen(false)}
+                  className="rounded-xl border border-slate-300 px-4 py-2 hover:bg-slate-50 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSchedule}
+                  className="rounded-xl bg-blue-600 px-4 py-2 text-white hover:bg-blue-700 transition font-medium"
+                >
+                  Schedule Email
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
