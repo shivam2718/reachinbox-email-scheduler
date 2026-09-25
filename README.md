@@ -1,7 +1,7 @@
 # Reachinbox Email Scheduler
 
 A full-stack email scheduling application with persistence, rate limiting, and concurrent email delivery. Built with **Express**, **React**, **PostgreSQL**, **Redis**, and **BullMQ**.
-
+### demo video link : https://drive.google.com/file/d/1Kcal1L8I_cKEttmHp2vDIZMbiAluApR1/view?usp=sharing
 ## Features
 
 ### ✅ Core Features Implemented
